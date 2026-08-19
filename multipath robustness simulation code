@@ -1,0 +1,171 @@
+"""
+Complex Indoor Multipath Simulation: Walls + Human Movement
+-------------------------------------------------------------------------
+Extends the earlier simple 2-ray check into a more realistic indoor channel:
+
+  1. WALLS / FURNITURE (multipath):
+     A 6-tap frequency-selective channel with an exponential power-delay
+     profile (delays 0-250 ns, matching the ~50-300 ns office delay spread
+     used in the accompanying literature paper) -- i.e. multiple reflected
+     copies of the signal, not just one.
+
+  2. HUMAN MOVEMENT (time-varying channel):
+     The channel taps evolve over time using a first-order AR(1) process
+     (a standard, simple way to model a slowly time-varying indoor channel
+     caused by people/objects moving and continuously changing the
+     reflection paths), rather than being frozen for the whole run.
+
+  3. SHADOWING / BLOCKAGE (a person walking through the direct path):
+     At random times, a temporary deep-fade "blockage" event is applied
+     (extra attenuation for a short burst of symbols), modeling someone
+     physically walking between transmitter and receiver.
+
+theta = 60 deg is kept FIXED (not time-varying) so this test isolates the
+new variable (a realistic multipath + movement channel), the same way
+every other experiment in this thesis isolates one variable at a time.
+Time-varying THETA (device rotation) is covered separately on the
+Mobility Robustness slide.
+
+Transmitter sends only on the H branch (sV = 0); conventional Wi-Fi reads
+only rH, RPW-OFDM combines rH and rV -- same core mechanism as every
+other result in this thesis.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------- Parameters -----------------------------
+K = 64                          # OFDM subcarriers
+theta_deg = 60
+theta = np.deg2rad(theta_deg)
+snr_db_range = np.arange(0, 31, 2)
+
+T = 300                         # time steps (OFDM symbols) per realization
+                                 # -- this is what lets the channel "move"
+M = 20                           # independent realizations, averaged
+
+rho = 0.98                       # AR(1) time-correlation (close to 1 = slow,
+                                  # realistic indoor movement between symbols)
+p_block_start = 0.01             # probability per time step that a new
+                                  # "person walks through" blockage event starts
+block_len_range = (5, 15)        # blockage event duration, in time steps
+block_atten = 0.15               # extra attenuation during a blockage event
+
+rng = np.random.default_rng(11)
+
+# --- Walls / furniture: 6-tap exponential power-delay profile ---
+delays_ns = np.array([0, 50, 100, 150, 200, 250])
+tau_rms = 100.0
+tap_powers = np.exp(-delays_ns / tau_rms)
+tap_powers /= tap_powers.sum()
+
+def gen_time_varying_channel(rng, T, K):
+    """Generate a (T, K) array of per-subcarrier fading gains that evolve
+    over time (AR(1) per tap) and include random blockage events."""
+    n_taps = len(tap_powers)
+    taps = np.zeros((T, n_taps), dtype=complex)
+    # initialize
+    taps[0] = (rng.standard_normal(n_taps) + 1j * rng.standard_normal(n_taps)) \
+              * np.sqrt(tap_powers / 2)
+    for t in range(1, T):
+        innovation = (rng.standard_normal(n_taps) + 1j * rng.standard_normal(n_taps)) \
+                     * np.sqrt(tap_powers / 2)
+        taps[t] = rho * taps[t - 1] + np.sqrt(1 - rho ** 2) * innovation
+
+    # Frequency response per time step
+    H_freq = np.fft.fft(taps, n=K, axis=1)     # (T, K)
+    g = np.abs(H_freq)
+
+    # Blockage events (person walking through)
+    block_mask = np.ones(T)
+    t = 0
+    while t < T:
+        if rng.random() < p_block_start:
+            dur = rng.integers(block_len_range[0], block_len_range[1] + 1)
+            block_mask[t:t + dur] = block_atten
+            t += dur
+        else:
+            t += 1
+    g = g * block_mask[:, np.newaxis]
+
+    g = g / np.sqrt(np.mean(g ** 2))  # normalize avg power = 1
+    return g, block_mask
+
+def bpsk_symbols(shape, rng):
+    bits = rng.integers(0, 2, shape)
+    return 2 * bits - 1, bits
+
+def run_ber_sim(snr_db_range, use_rpw):
+    ber = []
+    for snr_db in snr_db_range:
+        snr_lin = 10 ** (snr_db / 10)
+        noise_std = 1 / np.sqrt(2 * snr_lin)
+        total_errors, total_bits = 0, 0
+        for m in range(M):
+            g_k, _ = gen_time_varying_channel(rng, T, K)   # (T, K)
+
+            s, bits = bpsk_symbols((T, K), rng)
+            sH = g_k * s
+            sV = np.zeros_like(sH)
+
+            rH = np.cos(theta) * sH + np.sin(theta) * sV
+            rV = -np.sin(theta) * sH + np.cos(theta) * sV
+
+            nH = noise_std * rng.standard_normal(sH.shape)
+            nV = noise_std * rng.standard_normal(sH.shape)
+            rH = rH + nH
+            rV = rV + nV
+
+            s_hat = (np.cos(theta) * rH - np.sin(theta) * rV) if use_rpw else rH
+            bits_hat = (s_hat > 0).astype(int)
+            total_errors += np.sum(bits_hat != bits)
+            total_bits += bits.size
+        ber.append(total_errors / total_bits)
+    return np.array(ber)
+
+ber_conventional = run_ber_sim(snr_db_range, use_rpw=False)
+ber_rpw = run_ber_sim(snr_db_range, use_rpw=True)
+
+print(f"{'SNR (dB)':>8} | {'Conventional BER':>18} | {'RPW-OFDM BER':>14} | {'RPW better?':>12}")
+print("-" * 62)
+for snr, bc, br in zip(snr_db_range, ber_conventional, ber_rpw):
+    print(f"{snr:8d} | {bc:18.5f} | {br:14.5f} | {'YES' if br < bc else 'NO':>12}")
+
+all_better = np.all(ber_rpw <= ber_conventional)
+print("\nResult:", "RPW-OFDM outperforms conventional Wi-Fi at every SNR point, "
+      "even with walls (multipath) + human movement (time-varying fading + blockage) present."
+      if all_better else
+      "WARNING: RPW did NOT outperform conventional at every point -- inspect before using in slides.")
+
+# ----------------------------- Plot -----------------------------
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+# Left: BER vs SNR result
+axes[0].semilogy(snr_db_range, np.clip(ber_conventional, 1e-6, None), 'b-o',
+                  label=f'Conventional Wi-Fi (H-pol, {theta_deg}°)')
+axes[0].semilogy(snr_db_range, np.clip(ber_rpw, 1e-6, None), 'r-s',
+                  label=f'Proposed RPW-OFDM Wi-Fi ({theta_deg}°)')
+axes[0].set_xlabel('SNR (dB)')
+axes[0].set_ylabel('Bit Error Rate (BER)')
+axes[0].set_title('BER vs. SNR\n(walls + human movement)')
+axes[0].grid(True, which='both')
+axes[0].legend()
+
+# Right: illustrative channel envelope over time (one realization),
+# showing multipath fading fluctuating due to movement, with a blockage event
+g_illust, block_mask = gen_time_varying_channel(rng, T, K)
+avg_envelope_db = 20 * np.log10(np.mean(g_illust, axis=1) + 1e-6)
+axes[1].plot(avg_envelope_db, color='purple', linewidth=1.2)
+blocked_times = np.where(block_mask < 1)[0]
+if len(blocked_times) > 0:
+    axes[1].scatter(blocked_times, avg_envelope_db[blocked_times],
+                     color='black', s=4, label='Blockage (person walking through)')
+axes[1].set_xlabel('Time (OFDM symbol index)')
+axes[1].set_ylabel('Avg. channel gain (dB)')
+axes[1].set_title('Illustrative Channel Envelope Over Time\n(movement-induced fading)')
+axes[1].legend(loc='lower right', fontsize=8)
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.savefig('complex_indoor_multipath.png', dpi=200)
+print("\nSaved plot to complex_indoor_multipath.png")
